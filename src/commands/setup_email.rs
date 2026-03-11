@@ -82,6 +82,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .interact_text()?;
     let auth_email = auth_email.trim();
 
+    let forward_email: String = Input::new()
+        .with_prompt("Forward incoming email to (leave empty to skip)")
+        .allow_empty(true)
+        .interact_text()?;
+    let forward_email = forward_email.trim();
+    let setup_email_routing = !forward_email.is_empty();
+
     println!();
 
     // ── Phase 1: SES Domain Verification ───────────────────────────────
@@ -157,13 +164,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .send()?
         .json::<Value>()?;
 
-    let zone_id = zones_response["result"]
+    let zone = zones_response["result"]
         .as_array()
         .and_then(|zones| zones.first())
-        .and_then(|zone| zone["id"].as_str())
         .ok_or(format!(
             "Domain {domain} not found in Cloudflare. Add it there first."
-        ))?
+        ))?;
+
+    let zone_id = zone["id"]
+        .as_str()
+        .ok_or("Missing zone ID in Cloudflare response")?
+        .to_string();
+
+    let cf_account_id = zone["account"]["id"]
+        .as_str()
+        .ok_or("Missing account ID in Cloudflare zone response")?
         .to_string();
 
     println!("  Zone ID: {zone_id}");
@@ -177,6 +192,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         "TXT",
         &format!("_amazonses.{domain}"),
         &verification_token,
+        None,
     )?;
     println!("  + TXT _amazonses.{domain}");
 
@@ -188,9 +204,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             "CNAME",
             &format!("{token}._domainkey.{domain}"),
             &format!("{token}.dkim.amazonses.com"),
+            None,
         )?;
         println!("  + CNAME {token}._domainkey.{domain}");
     }
+
+    let spf_value = if setup_email_routing {
+        "v=spf1 include:amazonses.com include:_spf.mx.cloudflare.net ~all"
+    } else {
+        "v=spf1 include:amazonses.com ~all"
+    };
 
     add_cf_record(
         &client,
@@ -198,7 +221,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         &zone_id,
         "TXT",
         domain,
-        "v=spf1 include:amazonses.com ~all",
+        spf_value,
+        None,
     )?;
     println!("  + TXT {domain} (SPF)");
 
@@ -209,10 +233,118 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         "TXT",
         &format!("_dmarc.{domain}"),
         &format!("v=DMARC1; p=quarantine; rua=mailto:dmarc@{domain}"),
+        None,
     )?;
     println!("  + TXT _dmarc.{domain} (DMARC)");
 
-    // ── Phase 3: Delivery Webhooks ─────────────────────────────────────
+    // ── Phase 3: Email Routing ───────────────────────────────────────────
+
+    if setup_email_routing {
+        println!("\n── Email Routing ──\n");
+
+        println!("→ Enabling email routing...");
+        let response = client
+            .post(format!("{CF_API_BASE}/zones/{zone_id}/email/routing/enable"))
+            .bearer_auth(cf_token)
+            .send()?
+            .json::<Value>()?;
+
+        if response["success"].as_bool() != Some(true) {
+            let errors = &response["errors"];
+            let error_str = errors.to_string();
+            if !error_str.contains("already enabled") {
+                return Err(format!("Failed to enable email routing: {errors}").into());
+            }
+        }
+        println!("  Enabled");
+
+        println!("→ Adding MX records...");
+        for (server, priority) in [
+            ("route1.mx.cloudflare.net", 12),
+            ("route2.mx.cloudflare.net", 41),
+            ("route3.mx.cloudflare.net", 69),
+        ] {
+            add_cf_record(
+                &client,
+                cf_token,
+                &zone_id,
+                "MX",
+                domain,
+                server,
+                Some(priority),
+            )?;
+            println!("  + MX {server} (priority {priority})");
+        }
+
+        println!("→ Setting up destination: {forward_email}...");
+
+        let destinations = client
+            .get(format!(
+                "{CF_API_BASE}/accounts/{cf_account_id}/email/routing/addresses"
+            ))
+            .bearer_auth(cf_token)
+            .send()?
+            .json::<Value>()?;
+
+        let already_verified = destinations["result"]
+            .as_array()
+            .and_then(|addrs| {
+                addrs
+                    .iter()
+                    .find(|a| a["email"].as_str() == Some(forward_email))
+            })
+            .is_some_and(|addr| !addr["verified"].is_null());
+
+        if already_verified {
+            println!("  Already verified");
+        } else {
+            let response = client
+                .post(format!(
+                    "{CF_API_BASE}/accounts/{cf_account_id}/email/routing/addresses"
+                ))
+                .bearer_auth(cf_token)
+                .json(&serde_json::json!({"email": forward_email}))
+                .send()?
+                .json::<Value>()?;
+
+            if response["success"].as_bool() == Some(true) {
+                println!("  Verification email sent to {forward_email}");
+                println!("  Check your inbox and click the verification link");
+            } else {
+                let errors = &response["errors"];
+                let error_str = errors.to_string();
+                if error_str.contains("already exists") {
+                    println!("  Already exists (check inbox if not yet verified)");
+                } else {
+                    return Err(
+                        format!("Failed to create destination address: {errors}").into(),
+                    );
+                }
+            }
+        }
+
+        println!("→ Creating catch-all routing rule...");
+        let response = client
+            .put(format!(
+                "{CF_API_BASE}/zones/{zone_id}/email/routing/rules/catch_all"
+            ))
+            .bearer_auth(cf_token)
+            .json(&serde_json::json!({
+                "actions": [{"type": "forward", "value": [forward_email]}],
+                "matchers": [{"type": "all"}],
+                "enabled": true
+            }))
+            .send()?
+            .json::<Value>()?;
+
+        if response["success"].as_bool() != Some(true) {
+            let errors = &response["errors"];
+            return Err(format!("Failed to create catch-all rule: {errors}").into());
+        }
+        println!("  *@{domain} → {forward_email}");
+    }
+
+    // ── Phase 4: Delivery Webhooks ─────────────────────────────────────
 
     println!("\n── Delivery Webhooks ──\n");
 
@@ -414,7 +546,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("  Subscription: pending confirmation");
 
-    // ── Phase 4: Wait for SES verification ─────────────────────────────
+    // ── Phase 5: Wait for SES verification ─────────────────────────────
 
     println!("\n── SES Verification ──\n");
 
@@ -477,6 +609,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nThen deploy: npx convex deploy");
     println!("SNS will automatically confirm the webhook subscription on first deploy.");
 
+    if setup_email_routing {
+        println!("\nEmail routing: *@{domain} → {forward_email}");
+        println!("Note: Your Cloudflare API token needs Email Routing edit permissions.");
+    }
+
     Ok(())
 }
 
@@ -487,6 +624,7 @@ fn add_cf_record(
     record_type: &str,
     name: &str,
     content: &str,
+    priority: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut body = serde_json::json!({
         "type": record_type,
@@ -497,6 +635,10 @@ fn add_cf_record(
 
     if record_type == "CNAME" {
         body["proxied"] = serde_json::json!(false);
+    }
+
+    if let Some(pri) = priority {
+        body["priority"] = serde_json::json!(pri);
     }
 
     let response = client
