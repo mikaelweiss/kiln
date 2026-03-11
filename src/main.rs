@@ -14,6 +14,8 @@ struct Cli {
 enum Commands {
     /// Create a new project
     Create,
+    /// Set up SES email sending, DNS records, and delivery webhooks for a domain
+    SetupEmail,
 }
 
 fn main() {
@@ -21,6 +23,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::Create => commands::create::run(),
+        Commands::SetupEmail => commands::setup_email::run(),
     };
 
     if let Err(e) = result {
